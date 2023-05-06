@@ -5,7 +5,7 @@ go 1.16
 require (
 	github.com/BurntSushi/toml v1.2.0 // indirect
 	github.com/bndr/gojenkins v1.1.0
-	github.com/caoyingjunz/pixiulib v0.0.0-20220819163605-c3c10ec3ed3c
+	github.com/caoyingjunz/pixiulib v0.0.0-20230410123811-8e48eda6d576
 	github.com/casbin/casbin/v2 v2.55.0
 	github.com/casbin/gorm-adapter/v3 v3.10.0
 	github.com/fatih/structs v1.1.0
