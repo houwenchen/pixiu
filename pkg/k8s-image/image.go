@@ -1,11 +1,22 @@
 package image
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/caoyingjunz/pixiulib/exec"
+	"k8s.io/apimachinery/pkg/util/version"
+)
+
+const (
+	remoteRegistryUrl string = "wenchenhou"
+	sourceRegistryUrl string = "registry.cn-hangzhou.aliyuncs.com/google_containers"
 )
 
 type kubeReleaseInfo struct {
@@ -35,10 +46,10 @@ type kubeReleaseInfo struct {
 	exec exec.Interface
 }
 
-const (
-	remoteRegistryUrl string = "wenchenhou"
-	sourceRegistryUrl string = "registry.cn-hangzhou.aliyuncs.com/google_containers"
-)
+type writeCounter struct {
+	total       int64
+	totalLength int64
+}
 
 type kubeadmResp struct {
 	Kind       string   `json:"kind"`
@@ -86,7 +97,7 @@ func (kr *kubeReleaseInfo) dockerExist() {
 	if err != nil {
 		kr.existDocker = false
 		fmt.Println("host docker env have some issue, please check")
-		panic(err)
+		// panic(err)
 	}
 	kr.existDocker = true
 }
@@ -145,8 +156,158 @@ func (kr *kubeReleaseInfo) getSubUnitVersionsViaKubeadm() error {
 
 // 使用 constantsUrl 构造 subUnitVersions
 func (kr *kubeReleaseInfo) getSubUnitVersionsViaConstantsUrl() error {
-	// TODO:
+	infos := make(map[string]string)
+	v, _ := version.ParseGeneric(kr.kubeVersion)
+	fmt.Println(v)
+	err := kr.getImageVersions(v, infos)
+	if err != nil {
+		return err
+	}
+	delete(infos, "conformance")
+	if version, ok := infos["coredns/coredns"]; ok {
+		delete(infos, "coredns/coredns")
+		infos["coredns"] = version
+	}
+	kr.subUnitVersions = infos
 	return nil
+}
+
+// parse the kubeadm config and obtain image versions that are not bound to the k8s version.
+func (kr *kubeReleaseInfo) getImageVersions(ver *version.Version, images map[string]string) error {
+	constants, _, err := kr.getFromURL()
+	// 这里不清楚为啥不加打印就会报错
+	fmt.Println(constants)
+	fmt.Println(err)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(constants, "\n")
+
+	// create a map of all required images
+	// map[coredns:v1.8.6 etcd:3.5.1-0 kube-apiserver:v1.23.0 kube-controller-manager:v1.23.0
+	// kube-proxy:v1.23.0 kube-scheduler:v1.23.0 pause:3.6]
+	k8sVersionV := "v" + ver.String()
+	images["kube-apiserver"] = k8sVersionV
+	images["kube-controller-manager"] = k8sVersionV
+	images["kube-scheduler"] = k8sVersionV
+	images["kube-proxy"] = k8sVersionV
+	images["etcd"] = ""
+	images["pause"] = ""
+
+	// images outside the scope of kubeadm, but still using the k8s version
+
+	// the hyperkube image was removed for version v1.17
+	if ver.Major() == 1 && ver.Minor() < 17 {
+		images["hyperkube"] = k8sVersionV
+	}
+	// the cloud-controller-manager image was removed for version v1.16
+	if ver.Major() == 1 && ver.Minor() < 16 {
+		images["cloud-controller-manager"] = k8sVersionV
+	}
+	// test the conformance image, but only for newer versions as it was added in v1.13.0-alpha.2
+	// also skip v1.21.0-beta.1 due to a bug that caused this image tag to not be released.
+	conformanceMinVer := version.MustParseSemantic("v1.13.0-alpha.2")
+	is21beta1, _ := ver.Compare("v1.21.0-beta.1")
+	if ver.AtLeast(conformanceMinVer) && is21beta1 != 0 {
+		images["conformance"] = k8sVersionV
+	}
+
+	// coredns changed image location after 1.21.0-alpha.1
+	coreDNSNewVer := version.MustParseSemantic("v1.21.0-alpha.1")
+	coreDNSPath := "coredns"
+	if ver.AtLeast(coreDNSNewVer) {
+		coreDNSPath = "coredns/coredns"
+	}
+
+	// parse the constants file and fetch versions.
+	// note: Split(...)[1] is safe here given a line contains the key.
+	for _, line := range lines {
+		if strings.Contains(line, "CoreDNSVersion = ") {
+			line = strings.TrimSpace(line)
+			line = strings.Split(line, "CoreDNSVersion = ")[1]
+			line = strings.Replace(line, `"`, "", -1)
+			images[coreDNSPath] = line
+		} else if strings.Contains(line, "DefaultEtcdVersion = ") {
+			line = strings.TrimSpace(line)
+			line = strings.Split(line, "DefaultEtcdVersion = ")[1]
+			line = strings.Replace(line, `"`, "", -1)
+			images["etcd"] = line
+		} else if strings.Contains(line, "PauseVersion = ") {
+			line = strings.TrimSpace(line)
+			line = strings.Split(line, "PauseVersion = ")[1]
+			line = strings.Replace(line, `"`, "", -1)
+			images["pause"] = line
+		}
+	}
+	// hardcode the tag for pause as older k8s branches lack a constant.
+	if images["pause"] == "" {
+		images["pause"] = "3.1"
+	}
+	// verify.
+	fmt.Printf("* getImageVersions(): [%s] %#v\n", ver.String(), images)
+	if images[coreDNSPath] == "" || images["etcd"] == "" {
+		return fmt.Errorf("at least one image version could not be set: %#v", images)
+	}
+	return nil
+}
+
+func (wc *writeCounter) PrintProgress() {
+	if wc.totalLength == 0 {
+		fmt.Printf("\r* progress...%d bytes", wc.total)
+		return
+	}
+	fmt.Printf("\r* progress...%d %% ", int64((float64(wc.total)/float64(wc.totalLength))*100.0))
+}
+
+func (wc *writeCounter) Write(p []byte) (int, error) {
+	n := len(p)
+	wc.total += int64(n)
+	return n, nil
+}
+
+// downloads the contents of a web page into a string.
+// use default timeout of 10 seconds.
+func (kr *kubeReleaseInfo) getFromURL() (string, int, error) {
+	url := kr.constantsUrl
+	t := time.Duration(time.Duration(10) * time.Second)
+	client := http.Client{
+		Timeout: t,
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", -1, err
+	}
+	req.Header.Set("Accept", "*/*")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", -1, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", -1, fmt.Errorf("responded with status: %d", resp.StatusCode)
+	}
+
+	len := resp.Header.Get("Content-Length")
+	sz, err := strconv.Atoi(len)
+	if err != nil {
+		sz = 0
+	}
+
+	var src io.Reader
+	var dst bytes.Buffer
+
+	counter := &writeCounter{totalLength: int64(sz)}
+	src = io.TeeReader(resp.Body, counter)
+
+	_, err = io.Copy(&dst, src)
+	if err != nil {
+		panic(err)
+	}
+
+	return dst.String(), sz, nil
 }
 
 // 维护 remoteImageInfo 和 sourceImageInfo 字段
@@ -226,7 +387,6 @@ func (kr *kubeReleaseInfo) retagImage(unitName string) error {
 	return nil
 }
 
-// TODO: 这里用了好多 for 循环，可以考虑用一个循环，然后传参数进来
 func (kr *kubeReleaseInfo) pushToRemoteRegistry(unitName string) error {
 	// docker image push wenchenhou/coredns:v1.8.6
 	out, err := kr.exec.Command("docker", "image", "push", kr.remoteImageInfo[unitName]).CombinedOutput()

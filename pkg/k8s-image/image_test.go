@@ -7,7 +7,7 @@ import (
 
 // TODO: 增加测试用例，增加对子方法的测试
 func TestNewKubeReleaseInfo(t *testing.T) {
-	kr := NewKubeReleaseInfo("v1.23.0")
+	kr := NewKubeReleaseInfo("v1.23.1")
 	fmt.Printf("%+v\n", kr)
 }
 
