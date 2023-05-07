@@ -12,13 +12,19 @@ type kubeReleaseInfo struct {
 	// kubernetes version
 	// eg: v1.23.0
 	kubeVersion string
-	// kube-apiserver, kube-controller-manager, kube-scheduler, kube-proxy, etcd, pause
+	// kube-apiserver, kube-controller-manager, kube-scheduler, kube-proxy, etcd, pause, coredns
 	subUnitVersions map[string]string
+	// 记录 kubeadm 获取组件版本信息时的镜像的前缀
+	subUnitPrefixs map[string]string
+	// 记录 kubernetes 集群的各个组件的 image 是否在 dockerhub 中存在
+	subUnitExist map[string]bool
 
 	// 存放 image 的 dockerhub 地址
-	remoteRegistry string
+	remoteRegistry  string
+	remoteImageInfo map[string]string
 	// 拉取 image 的地址
-	sourceRegistry string
+	sourceRegistry  string
+	sourceImageInfo map[string]string
 
 	// 当环境没有安装 kubeadm 时，从 kubernetes 的 constants 文件中解析版本
 	constantsUrl string
@@ -28,6 +34,11 @@ type kubeReleaseInfo struct {
 	// 主机上执行命令的接口
 	exec exec.Interface
 }
+
+const (
+	remoteRegistryUrl string = "wenchenhou"
+	sourceRegistryUrl string = "registry.cn-hangzhou.aliyuncs.com/google_containers"
+)
 
 type kubeadmResp struct {
 	Kind       string   `json:"kind"`
@@ -40,8 +51,12 @@ func NewKubeReleaseInfo(releaseBranch string) *kubeReleaseInfo {
 	kr := &kubeReleaseInfo{
 		kubeVersion:     releaseBranch,
 		subUnitVersions: make(map[string]string),
-		remoteRegistry:  "wenchenhou",
-		sourceRegistry:  "registry.cn-hangzhou.aliyuncs.com/google_containers",
+		subUnitPrefixs:  make(map[string]string),
+		subUnitExist:    make(map[string]bool),
+		remoteRegistry:  remoteRegistryUrl,
+		remoteImageInfo: make(map[string]string),
+		sourceRegistry:  sourceRegistryUrl,
+		sourceImageInfo: make(map[string]string),
 		constantsUrl:    fmt.Sprintf("https://raw.githubusercontent.com/kubernetes/kubernetes/%s/cmd/kubeadm/app/constants/constants.go", releaseBranch),
 		exec:            exec.New(),
 	}
@@ -59,7 +74,7 @@ func NewKubeReleaseInfo(releaseBranch string) *kubeReleaseInfo {
 func (kr *kubeReleaseInfo) Process() {
 	kr.checkDockerHub()
 	kr.pullFromSourceRegistry()
-	kr.reTag()
+	kr.retagImage()
 	kr.pushToRemoteRegistry()
 }
 
@@ -118,10 +133,13 @@ func (kr *kubeReleaseInfo) getSubUnitVersionsViaKubeadm() error {
 	}
 
 	// 对 images 进行处理, 将数据整合进 kubeReleaseInfo 的 subUnitVersions 字段
+	// k8s.gcr.io/coredns/coredns:v1.8.6
 	for _, image := range kubeadmresp.Images {
-		unitVersion := strings.Split(image, "/")
-		newUnitVersion := unitVersion[len(unitVersion)-1]
-		unitVersion = strings.Split(newUnitVersion, ":")
+		unitInfos := strings.Split(image, "/")
+		prefix := strings.Join(unitInfos[:len(unitInfos)-1], "/")
+		UnitAndVersion := unitInfos[len(unitInfos)-1]
+		unitVersion := strings.Split(UnitAndVersion, ":")
+		kr.subUnitPrefixs[unitVersion[0]] = prefix
 		kr.subUnitVersions[unitVersion[0]] = unitVersion[1]
 	}
 
@@ -135,23 +153,68 @@ func (kr *kubeReleaseInfo) getSubUnitVersionsViaConstantsUrl() error {
 }
 
 // 在做镜像转存前，先检查 dockerhub 中是否已经存在镜像
-func (kr *kubeReleaseInfo) checkDockerHub() bool {
-	// TODO:
-	return false
-}
-
-func (kr *kubeReleaseInfo) pullFromSourceRegistry() {
-	for unit, version := range kr.subUnitVersions {
-		// 构造 docker image pull 的格式
-		// docker image pull registry.cn-hangzhou.aliyuncs.com/google_containers/ingress-nginx/controller:v1.1.1
-		fmt.Println(unit, version)
+// 将检查的结果维护在 subUnitExist 字段中
+// 因为 docker search 没有办法获取 image 的 tag 信息
+// 所以使用 docker pull 的返回来判断 image 是否存在
+// 维护 subUnitExist 字段
+// TODO：后面的三个函数是否执行可以依赖这里维护的字段
+func (kr *kubeReleaseInfo) checkDockerHub() {
+	kr.buildAllImageInfo()
+	for unitName, unitInfo := range kr.remoteImageInfo {
+		// docker image pull wenchenhou/coredns:v1.8.6
+		// TODO: 本地存在没有 push 上去的情况需要考虑下
+		_, err := kr.exec.Command("docker", "image", "pull", unitInfo).CombinedOutput()
+		if err != nil {
+			kr.subUnitExist[unitName] = false
+			continue
+		}
+		kr.subUnitExist[unitName] = true
 	}
 }
 
-func (kr *kubeReleaseInfo) reTag() {
-
+// 维护 remoteImageInfo 和 sourceImageInfo 字段
+func (kr *kubeReleaseInfo) buildAllImageInfo() {
+	// 以组件 coredns 为例
+	// remoteImageInfo 中：wenchenhou/coredns:v1.8.6
+	// sourceImageInfo 中: registry.cn-hangzhou.aliyuncs.com/google_containers/coredns:v1.8.6
+	for unitName, unitVersion := range kr.subUnitVersions {
+		kr.remoteImageInfo[unitName] = kr.remoteRegistry + "/" + unitName + ":" + unitVersion
+		kr.sourceImageInfo[unitName] = kr.sourceRegistry + "/" + unitName + ":" + unitVersion
+	}
 }
 
-func (kr *kubeReleaseInfo) pushToRemoteRegistry() {
+func (kr *kubeReleaseInfo) pullFromSourceRegistry() {
+	for _, unitInfo := range kr.sourceImageInfo {
+		// docker image pull registry.cn-hangzhou.aliyuncs.com/google_containers/ingress-nginx/controller:v1.1.1
+		out, err := kr.exec.Command("docker", "image", "pull", unitInfo).CombinedOutput()
+		if err != nil {
+			fmt.Println("docker image pull failed, err: ", err)
+			continue
+		}
+		fmt.Println(string(out))
+	}
+}
 
+func (kr *kubeReleaseInfo) retagImage() {
+	for unitName, unitInfo := range kr.sourceImageInfo {
+		// docker image tag registry.cn-hangzhou.aliyuncs.com/google_containers/coredns:v1.8.6 wenchenhou/coredns:v1.8.6
+		_, err := kr.exec.Command("docker", "image", "tag", unitInfo, kr.remoteImageInfo[unitName]).CombinedOutput()
+		if err != nil {
+			fmt.Println("docker image tag failed, err: ", err)
+			continue
+		}
+	}
+}
+
+// TODO: 这里用了好多 for 循环，可以考虑用一个循环，然后传参数进来
+func (kr *kubeReleaseInfo) pushToRemoteRegistry() {
+	for _, unitInfo := range kr.remoteImageInfo {
+		// docker image push wenchenhou/coredns:v1.8.6
+		out, err := kr.exec.Command("docker", "image", "push", unitInfo).CombinedOutput()
+		if err != nil {
+			fmt.Println("docker image push failed, err: ", err)
+			continue
+		}
+		fmt.Println(string(out))
+	}
 }
